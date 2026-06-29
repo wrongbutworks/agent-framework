@@ -500,11 +500,24 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         context: ResponseContext,
         cancellation_signal: asyncio.Event,
     ) -> AsyncIterable[ResponseStreamEvent | dict[str, Any]]:
-        """Handle the creation of a response."""
+        """Handle the creation of a response.
+
+        This must be an async generator (using ``yield``) rather than an
+        ``async def`` that returns an ``AsyncIterable``.  The b8 agentserver SDK
+        passes the raw result of calling this function directly to
+        ``_intercept_checkpoints``, which does ``async for raw in handler_iterator``
+        without first normalising coroutines.  An async generator is returned
+        immediately as an ``AsyncGenerator`` object (iterable via ``__anext__``),
+        whereas a coroutine function would return a coroutine whose ``async for``
+        iteration raises ``TypeError`` before the handler body ever runs.
+        """
         if self._is_workflow_agent:
             # Workflow agents are handled differently because they require checkpoint restoration
-            return self._handle_inner_workflow(request, context, cancellation_signal)
-        return self._handle_inner_agent(request, context, cancellation_signal)
+            async for event in self._handle_inner_workflow(request, context, cancellation_signal):
+                yield event
+        else:
+            async for event in self._handle_inner_agent(request, context, cancellation_signal):
+                yield event
 
     @staticmethod
     def _create_response_event_stream(request: CreateResponse, context: ResponseContext) -> ResponseEventStream:
