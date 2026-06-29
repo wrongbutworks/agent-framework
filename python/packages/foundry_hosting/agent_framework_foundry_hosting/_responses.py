@@ -115,9 +115,22 @@ from azure.ai.agentserver.responses.streaming._builders import (
 from mcp import McpError
 from typing_extensions import Any
 
+try:
+    from azure.ai.agentserver.core._config import AgentConfig  # pylint: disable=no-name-in-module
+except ImportError:  # pragma: no cover - older core builds without this module
+    AgentConfig = None  # type: ignore[assignment,misc]
+
 logger = logging.getLogger(__name__)
 
 _AZURE_RESPONSES_MESSAGE_ROLE_TYPE = f"{MessageRole.__module__}:{MessageRole.__qualname__}"
+
+
+def _checkpoint_if_supported(stream: ResponseEventStream) -> ResponseStreamEvent | None:
+    """Return a checkpoint event when supported by the current responses SDK."""
+    checkpoint = getattr(stream, "checkpoint", None)
+    if callable(checkpoint):
+        return cast(ResponseStreamEvent, checkpoint())
+    return None
 
 
 # region Approval Storage
@@ -352,6 +365,7 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         prefix: str = "",
         options: ResponsesServerOptions | None = None,
         store: ResponseProviderProtocol | None = None,
+        steerable_conversations: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize a ResponsesHostServer.
@@ -359,8 +373,17 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         Args:
             agent: The agent to handle responses for.
             prefix: The URL prefix for the server.
-            options: Optional server options.
+            options: Optional server options. When provided, ``steerable_conversations``
+                is ignored in favour of whatever is set in the supplied options object.
             store: Optional response store.
+            steerable_conversations: When ``True``, concurrent turns on the same
+                conversation chain are queued rather than rejected with HTTP 409
+                ``conversation_locked``. The running handler is signalled via
+                ``cancellation_signal`` (``context.client_cancelled`` will be ``False``
+                to distinguish steering from a real client cancel), and the queued turn
+                is delivered once the current turn reaches a terminal event.
+                Requires ``store=True`` requests; composable with
+                ``resilient_background``. Defaults to ``False``.
             **kwargs: Additional keyword arguments.
 
         Note:
@@ -370,6 +393,34 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                in memory, because the hosting environment may get deactivated between
                requests, and any in-memory context would be lost.
         """
+        # Auto-enable resilient_background in hosted environments when no explicit options
+        # OR store are provided. In hosted environments the Foundry storage API is
+        # automatically configured as the response store, which satisfies the
+        # resilient_background requirement that the store survives process restarts.
+        # We only auto-enable when store=None so that callers who explicitly supply a
+        # store (e.g. InMemoryResponseProvider for testing) are not forced into an
+        # incompatible combination. Users can opt out by passing explicit
+        # options=ResponsesServerOptions(resilient_background=False).
+        if options is None and store is None and AgentConfig is not None:
+            try:
+                if AgentConfig.from_env().is_hosted:
+                    options = ResponsesServerOptions(
+                        resilient_background=True,
+                        steerable_conversations=steerable_conversations,
+                    )
+                    logger.info(
+                        "Hosted environment detected: auto-enabled resilient_background=True for crash recovery. "
+                        "Pass options=ResponsesServerOptions(resilient_background=False) to opt out."
+                    )
+            except Exception:  # pylint: disable=broad-except  # noqa: S110  # nosec B110
+                pass  # If config cannot be read, leave options as None and let super() use its defaults.
+
+        # When running outside a hosted environment (or when auto-enable was skipped
+        # because a store was provided), but steerable_conversations was requested,
+        # create a minimal options object to carry the flag.
+        if options is None and steerable_conversations:
+            options = ResponsesServerOptions(steerable_conversations=True)
+
         super().__init__(prefix=prefix, options=options, store=store, **kwargs)
 
         for provider in getattr(agent, "context_providers", []):
@@ -452,13 +503,23 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         """Handle the creation of a response."""
         if self._is_workflow_agent:
             # Workflow agents are handled differently because they require checkpoint restoration
-            return self._handle_inner_workflow(request, context)
-        return self._handle_inner_agent(request, context)
+            return self._handle_inner_workflow(request, context, cancellation_signal)
+        return self._handle_inner_agent(request, context, cancellation_signal)
+
+    @staticmethod
+    def _create_response_event_stream(request: CreateResponse, context: ResponseContext) -> ResponseEventStream:
+        """Create a response stream seeded from recovery state when available."""
+        if bool(getattr(context, "is_recovery", False)):
+            persisted_response = getattr(context, "persisted_response", None)
+            if persisted_response is not None:
+                return ResponseEventStream(response=persisted_response, response_id=context.response_id)
+        return ResponseEventStream(response_id=context.response_id, model=request.model)
 
     async def _handle_inner_agent(
         self,
         request: CreateResponse,
         context: ResponseContext,
+        cancellation_signal: asyncio.Event | None = None,
     ) -> AsyncIterable[ResponseStreamEvent | dict[str, Any]]:
         """Handle the creation of a response for a regular (non-workflow) agent."""
         input_items = await context.get_input_items()
@@ -475,7 +536,7 @@ class ResponsesHostServer(ResponsesAgentServerHost):
 
         chat_options, are_options_set = _to_chat_options(request)
 
-        response_event_stream = ResponseEventStream(response_id=context.response_id, model=request.model)
+        response_event_stream = self._create_response_event_stream(request, context)
 
         yield response_event_stream.emit_created()
         yield response_event_stream.emit_in_progress()
@@ -506,6 +567,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 builder = response_event_stream.add_output_item(oauth_item.id)
                 yield builder.emit_added(oauth_item)
                 yield builder.emit_done(oauth_item)
+            checkpoint_event = _checkpoint_if_supported(response_event_stream)
+            if checkpoint_event is not None:
+                yield checkpoint_event
             yield response_event_stream.emit_completed()
             return
 
@@ -524,12 +588,35 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                     approval_storage=self._approval_storage,
                 ):
                     yield item
+                checkpoint_event = _checkpoint_if_supported(response_event_stream)
+                if checkpoint_event is not None:
+                    yield checkpoint_event
                 yield response_event_stream.emit_completed()
             else:
                 if tracker is None:  # pragma: no cover - defensive, set above
                     raise RuntimeError("Streaming tracker was not initialized.")
                 # Run the agent in streaming mode
                 async for update in self._agent.run(stream=True, **run_kwargs):  # type: ignore[reportUnknownMemberType]
+                    # Cooperative exit on shutdown: defer to crash recovery when durable.
+                    shutdown: asyncio.Event | None = getattr(context, "shutdown", None)
+                    if shutdown is not None and shutdown.is_set():
+                        for event in tracker.close():
+                            yield event
+                        await context.exit_for_recovery()  # raises; re-invoked on next start
+                    if cancellation_signal is not None and cancellation_signal.is_set():
+                        for event in tracker.close():
+                            yield event
+                        # Emit a terminal so the framework can finalise this turn correctly.
+                        # The framework overrides completed → cancelled when
+                        # context.client_cancelled is True; for steering pressure
+                        # (client_cancelled=False) completed is the right terminal.
+                        client_cancelled = bool(getattr(context, "client_cancelled", False))
+                        logger.debug(
+                            "Response handler exiting early: %s",
+                            "client cancelled" if client_cancelled else "steering pressure",
+                        )
+                        yield response_event_stream.emit_completed()
+                        return
                     for content in update.contents:
                         for event in tracker.handle(content):
                             yield event
@@ -545,6 +632,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 # Close any remaining active builder
                 for event in tracker.close():
                     yield event
+                checkpoint_event = _checkpoint_if_supported(response_event_stream)
+                if checkpoint_event is not None:
+                    yield checkpoint_event
                 yield response_event_stream.emit_completed()
         except Exception:
             # Drain any in-progress streaming builder before emitting consent
@@ -559,6 +649,7 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         self,
         request: CreateResponse,
         context: ResponseContext,
+        cancellation_signal: asyncio.Event | None = None,
     ) -> AsyncIterable[ResponseStreamEvent | dict[str, Any]]:
         """Handle the creation of a response for a workflow agent.
 
@@ -576,6 +667,12 @@ class ResponsesHostServer(ResponsesAgentServerHost):
 
         if request.previous_response_id is not None and context.conversation_id is not None:
             raise RuntimeError("Previous response ID cannot be used in conjunction with conversation ID.")
+        # For steerable chains ``previous_response_id`` equals ``context.conversation_chain_id``
+        # (the framework derives the chain id as the previous response id for steerable turns),
+        # so the existing restore logic using ``previous_response_id`` is already correct and
+        # produces the same key as ``conversation_chain_id`` would.  For conversation-id chains
+        # both resolve to ``conversation_id``.  No separate ``conversation_chain_id`` branch is
+        # needed here.
         context_id = request.previous_response_id or context.conversation_id
 
         # The following should never happen due to the checks above.
@@ -651,7 +748,7 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 )
 
         # Now run the agent with the latest input
-        response_event_stream = ResponseEventStream(response_id=context.response_id, model=request.model)
+        response_event_stream = self._create_response_event_stream(request, context)
 
         yield response_event_stream.emit_created()
         yield response_event_stream.emit_in_progress()
@@ -672,6 +769,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 yield item
 
             await self._delete_not_latest_checkpoints(write_storage, self._agent.workflow.name)
+            checkpoint_event = _checkpoint_if_supported(response_event_stream)
+            if checkpoint_event is not None:
+                yield checkpoint_event
             yield response_event_stream.emit_completed()
             return
 
@@ -685,6 +785,23 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             stream=True,
             checkpoint_storage=write_storage,
         ):
+            # Cooperative exit on shutdown: defer to crash recovery when durable.
+            shutdown: asyncio.Event | None = getattr(context, "shutdown", None)
+            if shutdown is not None and shutdown.is_set():
+                for event in tracker.close():
+                    yield event
+                await context.exit_for_recovery()  # raises; re-invoked on next start
+            # Cooperative exit on cancellation (steering pressure or client cancel).
+            if cancellation_signal is not None and cancellation_signal.is_set():
+                for event in tracker.close():
+                    yield event
+                client_cancelled = bool(getattr(context, "client_cancelled", False))
+                logger.debug(
+                    "Workflow response handler exiting early: %s",
+                    "client cancelled" if client_cancelled else "steering pressure",
+                )
+                yield response_event_stream.emit_completed()
+                return
             for content in update.contents:
                 for event in tracker.handle(content):
                     yield event
@@ -700,6 +817,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             yield event
 
         await self._delete_not_latest_checkpoints(write_storage, self._agent.workflow.name)
+        checkpoint_event = _checkpoint_if_supported(response_event_stream)
+        if checkpoint_event is not None:
+            yield checkpoint_event
         yield response_event_stream.emit_completed()
 
     @staticmethod
@@ -743,6 +863,7 @@ class _OutputItemTracker:
         self._summary_part: ReasoningSummaryPartBuilder | None = None
         self._fc_builder: OutputItemFunctionCallBuilder | None = None
         self._mcp_builder: OutputItemMcpCallBuilder | None = None
+        self._mcp_call_id: str | None = None  # call_id of the in-progress MCP call for result matching
         self.needs_async = False
 
     def handle(self, content: Content) -> Generator[ResponseStreamEvent]:
@@ -791,17 +912,20 @@ class _OutputItemTracker:
             and self._active_type == "mcp_server_tool_call"
             and self._mcp_builder is not None
             and content.call_id is not None
-            and content.call_id == self._mcp_builder.item_id
+            and content.call_id == self._mcp_call_id
         ):
             accumulated = "".join(self._accumulated)
             yield self._mcp_builder.emit_arguments_done(accumulated)
             yield self._mcp_builder.emit_completed()
-            yield self._mcp_builder.emit_done(output=_stringify_mcp_output(content.output))
+            yield self._mcp_builder.emit_done()
             self._mcp_builder = None
+            self._mcp_call_id = None
             self._active_type = None
             self._active_id = None
             self._accumulated.clear()
-            self.needs_async = False
+            # In b8 the mcp_call done event no longer carries output inline.
+            # Signal the async path to emit a separate custom_tool_call_output item.
+            self.needs_async = True
             return
 
         else:
@@ -843,8 +967,8 @@ class _OutputItemTracker:
         self._mcp_builder = self._stream.add_output_item_mcp_call(
             server_label=content.server_name or "default",
             name=content.tool_name or "",
-            item_id=content.call_id,
         )
+        self._mcp_call_id = content.call_id
         self._active_type = "mcp_server_tool_call"
         self._active_id = content.call_id or f"{content.server_name or 'default'}::{content.tool_name}"
         yield self._mcp_builder.emit_added()
@@ -876,6 +1000,7 @@ class _OutputItemTracker:
             yield self._mcp_builder.emit_completed()
             yield self._mcp_builder.emit_done()
             self._mcp_builder = None
+            self._mcp_call_id = None
 
         self._active_type = None
         self._active_id = None
@@ -1656,7 +1781,6 @@ async def _to_outputs(
         mcp_call = stream.add_output_item_mcp_call(
             server_label=content.server_name or "default",
             name=content.tool_name or "",
-            item_id=content.call_id,
         )
         yield mcp_call.emit_added()
         async for event in mcp_call.aarguments(_arguments_to_str(content.arguments)):
@@ -1664,13 +1788,7 @@ async def _to_outputs(
         yield mcp_call.emit_completed()
         yield mcp_call.emit_done()
     elif content.type == "mcp_server_tool_result":
-        output = (
-            content.output
-            if isinstance(content.output, str)
-            else str(content.output)
-            if content.output is not None
-            else ""
-        )
+        output = _stringify_mcp_output(content.output)
         async for event in stream.aoutput_item_custom_tool_call_output(content.call_id or "", output):
             yield event
     elif content.type == "shell_tool_call":
@@ -1754,23 +1872,29 @@ def _stringify_mcp_output(output: Any) -> str:
     return str(output)
 
 
-def _emit_completed_mcp_call(
+async def _emit_completed_mcp_call(
     stream: ResponseEventStream,
     call_content: Content,
     *,
     arguments: str,
     output: str,
-) -> Generator[ResponseStreamEvent]:
-    """Emit a single completed MCP call item carrying both arguments and output."""
+) -> AsyncIterator[ResponseStreamEvent]:
+    """Emit a completed MCP call item followed by a separate output item.
+
+    In b8 the mcp_call done event no longer carries an inline ``output`` field.
+    The output is emitted as a ``custom_tool_call_output`` item so that history
+    reconstruction on subsequent turns can recover the result.
+    """
     mcp_call = stream.add_output_item_mcp_call(
         server_label=call_content.server_name or "default",
         name=call_content.tool_name or "",
-        item_id=call_content.call_id,
     )
     yield mcp_call.emit_added()
     yield mcp_call.emit_arguments_done(arguments)
     yield mcp_call.emit_completed()
-    yield mcp_call.emit_done(output=output)
+    yield mcp_call.emit_done()
+    async for event in stream.aoutput_item_custom_tool_call_output(call_content.call_id or "", output):
+        yield event
 
 
 async def _to_outputs_for_messages(
@@ -1792,7 +1916,7 @@ async def _to_outputs_for_messages(
         for content in message.contents:
             if pending_mcp_call is not None:
                 if content.type == "mcp_server_tool_result" and content.call_id == pending_mcp_call.call_id:
-                    for event in _emit_completed_mcp_call(
+                    async for event in _emit_completed_mcp_call(
                         stream,
                         pending_mcp_call,
                         arguments=_arguments_to_str(pending_mcp_call.arguments),

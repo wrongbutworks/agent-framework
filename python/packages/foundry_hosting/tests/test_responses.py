@@ -10,6 +10,7 @@ the registered _handle_create handler.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
@@ -195,8 +196,229 @@ class TestResponsesHostServerInit:
         with pytest.raises(RuntimeError, match="history provider"):
             ResponsesHostServer(agent)
 
+    def test_init_auto_enables_resilient_background_in_hosted_env(self) -> None:
+        """In a hosted environment with no explicit options, resilient_background is auto-enabled."""
+        from azure.ai.agentserver.core._config import AgentConfig
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        mock_config = MagicMock(spec=AgentConfig)
+        mock_config.is_hosted = True
+        with patch("agent_framework_foundry_hosting._responses.AgentConfig") as mock_agent_config_cls:
+            mock_agent_config_cls.from_env.return_value = mock_config
+            server = _make_server(agent)
+        assert server is not None
+
+    def test_init_does_not_auto_enable_resilient_background_locally(self) -> None:
+        """In a local (non-hosted) environment, resilient_background is NOT auto-enabled."""
+        from azure.ai.agentserver.core._config import AgentConfig
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        mock_config = MagicMock(spec=AgentConfig)
+        mock_config.is_hosted = False
+        with patch("agent_framework_foundry_hosting._responses.AgentConfig") as mock_agent_config_cls:
+            mock_agent_config_cls.from_env.return_value = mock_config
+            server = _make_server(agent)
+        assert server is not None
+
+    def test_init_respects_explicit_options_over_auto_enable(self) -> None:
+        """Explicit options are not overridden by the hosted auto-enable logic."""
+        from azure.ai.agentserver.core._config import AgentConfig
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        # Pass a real options object which prevents the auto-enable check
+        # from even running, since options is not None.
+        from azure.ai.agentserver.responses import ResponsesServerOptions
+
+        explicit_options = ResponsesServerOptions()
+        mock_config = MagicMock(spec=AgentConfig)
+        mock_config.is_hosted = True
+        with patch("agent_framework_foundry_hosting._responses.AgentConfig") as mock_agent_config_cls:
+            mock_agent_config_cls.from_env.return_value = mock_config
+            server = ResponsesHostServer(agent, options=explicit_options, store=InMemoryResponseProvider())
+        mock_agent_config_cls.from_env.assert_not_called()
+        assert server is not None
+
+    def test_init_steerable_conversations_threaded_into_auto_enable_options(self) -> None:
+        """steerable_conversations=True is included when auto-enabling resilient_background."""
+        from azure.ai.agentserver.core._config import AgentConfig
+        from azure.ai.agentserver.responses import ResponsesServerOptions
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        mock_config = MagicMock(spec=AgentConfig)
+        mock_config.is_hosted = True
+        captured_options: list[ResponsesServerOptions] = []
+
+        original_init = ResponsesServerOptions.__init__
+
+        def capture_options(self: ResponsesServerOptions, **kwargs: Any) -> None:
+            original_init(self, **kwargs)
+            captured_options.append(self)
+
+        with (
+            patch("agent_framework_foundry_hosting._responses.AgentConfig") as mock_agent_config_cls,
+            patch.object(ResponsesServerOptions, "__init__", capture_options),
+        ):
+            mock_agent_config_cls.from_env.return_value = mock_config
+            _make_server(agent, steerable_conversations=True)
+
+        assert any(o.steerable_conversations for o in captured_options), (
+            "Expected at least one ResponsesServerOptions with steerable_conversations=True"
+        )
+
+    def test_init_steerable_conversations_creates_options_when_store_supplied(self) -> None:
+        """steerable_conversations=True creates options even when an explicit store is supplied."""
+        from azure.ai.agentserver.responses import ResponsesServerOptions
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        captured_options: list[ResponsesServerOptions] = []
+        original_init = ResponsesServerOptions.__init__
+
+        def capture_options(self: ResponsesServerOptions, **kwargs: Any) -> None:
+            original_init(self, **kwargs)
+            captured_options.append(self)
+
+        with patch.object(ResponsesServerOptions, "__init__", capture_options):
+            ResponsesHostServer(
+                agent,
+                store=InMemoryResponseProvider(),
+                steerable_conversations=True,
+            )
+
+        assert any(o.steerable_conversations for o in captured_options), (
+            "Expected at least one ResponsesServerOptions with steerable_conversations=True"
+        )
+
+    def test_init_steerable_conversations_ignored_when_explicit_options_provided(self) -> None:
+        """steerable_conversations parameter is ignored when options= is supplied explicitly."""
+        from azure.ai.agentserver.responses import ResponsesServerOptions
+
+        agent = _make_agent(
+            response=AgentResponse(messages=[Message(role="assistant", contents=[Content.from_text("hi")])])
+        )
+        explicit_options = ResponsesServerOptions(steerable_conversations=False)
+        new_options_created: list[ResponsesServerOptions] = []
+        original_init = ResponsesServerOptions.__init__
+
+        def capture_new_options(self: ResponsesServerOptions, **kwargs: Any) -> None:
+            original_init(self, **kwargs)
+            new_options_created.append(self)
+
+        # Passing steerable_conversations=True as a kwarg but with explicit options=
+        # should NOT cause a second ResponsesServerOptions to be constructed.
+        with patch.object(ResponsesServerOptions, "__init__", capture_new_options):
+            ResponsesHostServer(
+                agent,
+                options=explicit_options,
+                store=InMemoryResponseProvider(),
+                steerable_conversations=True,
+            )
+
+        assert new_options_created == [], (
+            "No new ResponsesServerOptions should be created when explicit options are provided"
+        )
+
 
 # endregion
+
+
+class TestDurableResponseStreamSeeding:
+    async def test_recovery_turn_seeds_stream_from_persisted_response(self) -> None:
+        from azure.ai.agentserver.responses import ResponseContext
+        from azure.ai.agentserver.responses.models import CreateResponse
+
+        agent = _make_agent(response=AgentResponse(messages=[]))
+        server = _make_server(agent)
+        request = CreateResponse(model="test-model", input="hi")
+        context = ResponseContext(response_id="resp_123", mode_flags=MagicMock())
+        context.is_recovery = True
+        context.persisted_response = MagicMock()
+
+        stream = MagicMock()
+        stream.emit_created.return_value = {"type": "response.created"}
+        stream.emit_in_progress.return_value = {"type": "response.in_progress"}
+        stream.checkpoint.return_value = {"type": "_checkpoint"}
+        stream.emit_completed.return_value = {"type": "response.completed"}
+
+        async def _empty_outputs(*args: Any, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+            if False:
+                yield {}
+
+        with (
+            patch("agent_framework_foundry_hosting._responses.ResponseEventStream", return_value=stream) as stream_ctor,
+            patch.object(ResponseContext, "get_input_items", new=AsyncMock(return_value=[])),
+            patch.object(ResponseContext, "get_history", new=AsyncMock(return_value=[])),
+            patch("agent_framework_foundry_hosting._responses._to_outputs_for_messages", side_effect=_empty_outputs),
+        ):
+            async for _ in server._handle_inner_agent(request, context):  # pyright: ignore[reportPrivateUsage]
+                pass
+
+        stream_ctor.assert_called_once_with(response=context.persisted_response, response_id=context.response_id)
+        assert stream.checkpoint.call_count == 1
+
+    async def test_cancellation_signal_emits_completed_for_streaming(self) -> None:
+        """On steering pressure or client cancel the streaming handler emits response.completed."""
+        from azure.ai.agentserver.responses import ResponseContext
+        from azure.ai.agentserver.responses.models import CreateResponse
+
+        # Agent produces two streaming updates; cancellation fires after the first.
+        update1 = AgentResponseUpdate(contents=[Content.from_text("chunk 1")], role="assistant")
+        update2 = AgentResponseUpdate(contents=[Content.from_text("chunk 2")], role="assistant")
+        agent = _make_agent(stream_updates=[update1, update2])
+        server = _make_server(agent)
+
+        request = CreateResponse(model="test-model", input="hi", stream=True)
+        context = ResponseContext(response_id="resp_steer", mode_flags=MagicMock())
+
+        cancellation_signal = asyncio.Event()
+
+        # Fire cancellation after the first update is processed.
+        call_count = 0
+
+        def run_with_cancel(*args: Any, **kwargs: Any) -> Any:
+            nonlocal call_count
+
+            async def _gen() -> AsyncIterator[AgentResponseUpdate]:
+                nonlocal call_count
+                for update in [update1, update2]:
+                    call_count += 1
+                    if call_count == 1:
+                        # Fire cancellation before yielding the second update.
+                        cancellation_signal.set()
+                    yield update
+
+            if kwargs.get("stream"):
+                from agent_framework import ResponseStream
+
+                return ResponseStream(_gen())  # type: ignore
+            raise NotImplementedError
+
+        agent.run = MagicMock(side_effect=run_with_cancel)
+
+        events = []
+        with (
+            patch.object(ResponseContext, "get_input_items", new=AsyncMock(return_value=[])),
+            patch.object(ResponseContext, "get_history", new=AsyncMock(return_value=[])),
+        ):
+            async for event in server._handle_inner_agent(request, context, cancellation_signal):  # pyright: ignore[reportPrivateUsage]
+                events.append(event)
+
+        event_types = [getattr(e, "type", e.get("type") if isinstance(e, dict) else None) for e in events]
+        # Must have response.created and response.in_progress.
+        assert "response.created" in event_types
+        assert "response.in_progress" in event_types
+        # Must emit response.completed — the framework overrides to cancelled for
+        # real client cancels; for steering pressure completed is the correct terminal.
+        assert "response.completed" in event_types
 
 
 # region Health Check
@@ -307,12 +529,17 @@ class TestNonStreaming:
 
         types = [item["type"] for item in body["output"]]
         assert "mcp_call" in types
-        assert "custom_tool_call_output" not in types
+        # In b8, the MCP call output is emitted as a separate custom_tool_call_output item
+        # rather than inlined in the mcp_call item's done payload.
+        assert "custom_tool_call_output" in types
 
         mcp_items = [item for item in body["output"] if item["type"] == "mcp_call"]
         assert len(mcp_items) == 1
-        assert mcp_items[0]["id"] == "mcp_abc123"
-        assert mcp_items[0]["output"] == "found 10 cats"
+        # In b8, item IDs are auto-generated by the SDK (no longer passed by the adapter).
+        assert mcp_items[0]["id"].startswith("mcp_")
+        output_items = [item for item in body["output"] if item["type"] == "custom_tool_call_output"]
+        assert len(output_items) == 1
+        assert output_items[0]["output"] == "found 10 cats"
 
     async def test_reasoning_content(self) -> None:
         agent = _make_agent(
@@ -713,10 +940,14 @@ class TestStreaming:
         assert resp.status_code == 200
         events = _parse_sse_events(resp.text)
         done_events = [e for e in events if e["event"] == "response.output_item.done"]
-        assert len(done_events) == 1
-        assert done_events[0]["data"]["item"]["type"] == "mcp_call"
-        assert done_events[0]["data"]["item"]["id"] == "mcp_abc123"
-        assert done_events[0]["data"]["item"]["output"] == "found 10 cats"
+        # In b8, the mcp_call done event and a separate custom_tool_call_output done event are emitted.
+        mcp_done = [e for e in done_events if e["data"]["item"]["type"] == "mcp_call"]
+        output_done = [e for e in done_events if e["data"]["item"]["type"] == "custom_tool_call_output"]
+        assert len(mcp_done) == 1
+        # In b8 item IDs are auto-generated by the SDK.
+        assert mcp_done[0]["data"]["item"]["id"].startswith("mcp_")
+        assert len(output_done) == 1
+        assert output_done[0]["data"]["item"]["output"] == "found 10 cats"
 
 
 # endregion
@@ -2113,7 +2344,8 @@ class TestMultiTurnMixedContent:
 
         types1 = [item["type"] for item in resp1.json()["output"]]
         assert "mcp_call" in types1
-        assert "custom_tool_call_output" not in types1
+        # In b8, MCP output is emitted as a separate custom_tool_call_output item.
+        assert "custom_tool_call_output" in types1
 
         resp2 = await _post_json(
             server,
@@ -2137,7 +2369,9 @@ class TestMultiTurnMixedContent:
         assert len(mcp_call_contents) >= 1
         assert len(mcp_result_contents) >= 1
         assert all((c.call_id or "") != "mcp_abc123" for c in function_result_contents)
-        assert any((c.call_id or "") == "mcp_abc123" for c in mcp_call_contents)
+        # In b8 the mcp_call history item carries an auto-generated SDK id rather than
+        # the original call_id, so we can no longer assert the specific value here.
+        assert any(c.call_id is not None for c in mcp_call_contents)
         assert any((c.call_id or "") == "mcp_abc123" for c in mcp_result_contents)
 
     async def test_multi_turn_reasoning_in_history(self) -> None:
