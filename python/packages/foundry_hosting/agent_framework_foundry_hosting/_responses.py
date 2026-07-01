@@ -393,31 +393,8 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                in memory, because the hosting environment may get deactivated between
                requests, and any in-memory context would be lost.
         """
-        # Auto-enable resilient_background in hosted environments when no explicit options
-        # OR store are provided. In hosted environments the Foundry storage API is
-        # automatically configured as the response store, which satisfies the
-        # resilient_background requirement that the store survives process restarts.
-        # We only auto-enable when store=None so that callers who explicitly supply a
-        # store (e.g. InMemoryResponseProvider for testing) are not forced into an
-        # incompatible combination. Users can opt out by passing explicit
-        # options=ResponsesServerOptions(resilient_background=False).
-        if options is None and store is None and AgentConfig is not None:
-            try:
-                if AgentConfig.from_env().is_hosted:
-                    options = ResponsesServerOptions(
-                        resilient_background=True,
-                        steerable_conversations=steerable_conversations,
-                    )
-                    logger.info(
-                        "Hosted environment detected: auto-enabled resilient_background=True for crash recovery. "
-                        "Pass options=ResponsesServerOptions(resilient_background=False) to opt out."
-                    )
-            except Exception:  # pylint: disable=broad-except  # noqa: S110  # nosec B110
-                pass  # If config cannot be read, leave options as None and let super() use its defaults.
-
-        # When running outside a hosted environment (or when auto-enable was skipped
-        # because a store was provided), but steerable_conversations was requested,
-        # create a minimal options object to carry the flag.
+        # When steerable_conversations is requested but no explicit options were
+        # provided, create a minimal options object to carry the flag.
         if options is None and steerable_conversations:
             options = ResponsesServerOptions(steerable_conversations=True)
 
