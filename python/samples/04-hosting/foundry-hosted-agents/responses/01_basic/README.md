@@ -46,8 +46,3 @@ curl -X POST http://localhost:8088/responses -H "Content-Type: application/json"
 ## Deploying the Agent to Foundry
 
 To host the agent on Foundry, follow the instructions in the [Deploying the Agent to Foundry](../../README.md#deploying-the-agent-to-foundry) section of the README in the parent directory.
-
-
-## Deploying the Agent to Foundry
-
-To host the agent on Foundry, follow the instructions in the [Deploying the Agent to Foundry](../../README.md#deploying-the-agent-to-foundry) section of the README in the parent directory.

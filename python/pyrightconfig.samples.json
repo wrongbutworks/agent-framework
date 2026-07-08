@@ -18,7 +18,13 @@
         "**/local_shell_with_environment_provider.py",
         "**/client_with_local_shell.py"
     ],
-    "typeCheckingMode": "off",
+    "typeCheckingMode": "basic",
     "reportMissingImports": "error",
+    "reportMissingModuleSource": false,
+    "reportMissingTypeStubs": false,
+    "reportPrivateImportUsage": false,
+    "reportPrivateUsage": false,
+    "reportTypedDictNotRequiredAccess": false,
+    "reportInvalidTypeVarUse": false,
     "reportAttributeAccessIssue": "error"
 }
