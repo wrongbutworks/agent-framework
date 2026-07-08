@@ -117,7 +117,9 @@ from typing_extensions import Any
 
 logger = logging.getLogger(__name__)
 
-_AZURE_RESPONSES_MESSAGE_ROLE_TYPE = f"{MessageRole.__module__}:{MessageRole.__qualname__}"
+_AZURE_RESPONSES_MESSAGE_ROLE_TYPE = (
+    f"{MessageRole.__module__}:{MessageRole.__qualname__}"
+)
 
 
 def _checkpoint_if_supported(stream: ResponseEventStream) -> ResponseStreamEvent | None:
@@ -132,7 +134,9 @@ def _checkpoint_if_supported(stream: ResponseEventStream) -> ResponseStreamEvent
 class ApprovalStorage(Protocol):
     """Storage for saving function approval requests."""
 
-    async def save_approval_request(self, approval_request_id: str, request: Content) -> None:
+    async def save_approval_request(
+        self, approval_request_id: str, request: Content
+    ) -> None:
         """Save a function approval request under the given ID."""
         ...
 
@@ -147,14 +151,20 @@ class InMemoryFunctionApprovalStorage:
     def __init__(self) -> None:
         self._store: dict[str, Content] = {}
 
-    async def save_approval_request(self, approval_request_id: str, request: Content) -> None:
+    async def save_approval_request(
+        self, approval_request_id: str, request: Content
+    ) -> None:
         if approval_request_id in self._store:
-            raise ValueError(f"Approval request with ID '{approval_request_id}' already exists.")
+            raise ValueError(
+                f"Approval request with ID '{approval_request_id}' already exists."
+            )
         self._store[approval_request_id] = request
 
     async def load_approval_request(self, approval_request_id: str) -> Content:
         if approval_request_id not in self._store:
-            raise KeyError(f"Approval request with ID '{approval_request_id}' does not exist.")
+            raise KeyError(
+                f"Approval request with ID '{approval_request_id}' does not exist."
+            )
         return self._store[approval_request_id]
 
 
@@ -186,7 +196,9 @@ class FileBasedFunctionApprovalStorage:
         directory = os.path.dirname(self._storage_path) or "."
         # Serialize first so any error doesn't leave a partial file behind.
         serialized = json.dumps(data)
-        fd, tmp_path = tempfile.mkstemp(prefix=".approvals-", suffix=".tmp", dir=directory)
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".approvals-", suffix=".tmp", dir=directory
+        )
         try:
             with os.fdopen(fd, "w") as tmp:
                 tmp.write(serialized)
@@ -202,7 +214,9 @@ class FileBasedFunctionApprovalStorage:
             with open(self._storage_path) as f:
                 data = json.load(f)
             if approval_request_id in data:
-                raise ValueError(f"Approval request with ID '{approval_request_id}' already exists.")
+                raise ValueError(
+                    f"Approval request with ID '{approval_request_id}' already exists."
+                )
             data[approval_request_id] = request.to_dict()
             self._atomic_write(data)
 
@@ -212,17 +226,23 @@ class FileBasedFunctionApprovalStorage:
             with open(self._storage_path) as f:
                 data = json.load(f)
         if approval_request_id not in data:
-            raise KeyError(f"Approval request with ID '{approval_request_id}' does not exist.")
+            raise KeyError(
+                f"Approval request with ID '{approval_request_id}' does not exist."
+            )
         return Content.from_dict(data[approval_request_id])
 
-    async def save_approval_request(self, approval_request_id: str, request: Content) -> None:
+    async def save_approval_request(
+        self, approval_request_id: str, request: Content
+    ) -> None:
         await asyncio.to_thread(self._save_sync, approval_request_id, request)
 
     async def load_approval_request(self, approval_request_id: str) -> Content:
         return await asyncio.to_thread(self._load_sync, approval_request_id)
 
 
-def _validate_path_segment(segment: str, *, kind: Literal["context id", "user id"]) -> None:
+def _validate_path_segment(
+    segment: str, *, kind: Literal["context id", "user id"]
+) -> None:
     """Validate that ``segment`` is a single safe path component (CWE-22).
 
     ``segment`` originates from caller-controlled fields (such as
@@ -258,7 +278,9 @@ def _validate_path_segment(segment: str, *, kind: Literal["context id", "user id
         raise RuntimeError(f"Invalid {kind}: {segment!r}")
 
 
-def _checkpoint_storage_for_context(root: str, context_id: str, *, user_id: str | None = None) -> FileCheckpointStorage:
+def _checkpoint_storage_for_context(
+    root: str, context_id: str, *, user_id: str | None = None
+) -> FileCheckpointStorage:
     """Build a ``FileCheckpointStorage`` for ``context_id`` rooted under ``root``.
 
     When the platform supplies a per-user partition key (``user_id``, from the
@@ -367,7 +389,9 @@ def consent_url_from_error(exc: BaseException) -> list[ConsentError] | None:
                 return None
             consent_details_json = inner_exception.error.message[error_message_start:]
             consent_details = json.loads(consent_details_json)
-            if "errors" not in consent_details or not isinstance(consent_details["errors"], list):
+            if "errors" not in consent_details or not isinstance(
+                consent_details["errors"], list
+            ):
                 logger.warning(
                     "Consent error message JSON does not contain 'errors' list: %s",
                     consent_details_json,
@@ -423,7 +447,6 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         prefix: str = "",
         options: ResponsesServerOptions | None = None,
         store: ResponseProviderProtocol | None = None,
-        steerable_conversations: bool = False,
         **kwargs: Any,
     ) -> None:
         """Initialize a ResponsesHostServer.
@@ -431,17 +454,8 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         Args:
             agent: The agent to handle responses for.
             prefix: The URL prefix for the server.
-            options: Optional server options. When provided, ``steerable_conversations``
-                is ignored in favour of whatever is set in the supplied options object.
+            options: Optional server options.
             store: Optional response store.
-            steerable_conversations: When ``True``, concurrent turns on the same
-                conversation chain are queued rather than rejected with HTTP 409
-                ``conversation_locked``. The running handler is signalled via
-                ``cancellation_signal`` (``context.client_cancelled`` will be ``False``
-                to distinguish steering from a real client cancel), and the queued turn
-                is delivered once the current turn reaches a terminal event.
-                Requires ``store=True`` requests; composable with
-                ``resilient_background``. Defaults to ``False``.
             **kwargs: Additional keyword arguments.
 
         Note:
@@ -451,11 +465,6 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                in memory, because the hosting environment may get deactivated between
                requests, and any in-memory context would be lost.
         """
-        # When steerable_conversations is requested but no explicit options were
-        # provided, create a minimal options object to carry the flag.
-        if options is None and steerable_conversations:
-            options = ResponsesServerOptions(steerable_conversations=True)
-
         super().__init__(prefix=prefix, options=options, store=store, **kwargs)
 
         for provider in getattr(agent, "context_providers", []):
@@ -555,7 +564,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         storage = self._approval_storages_by_user.get(user_id)
         if storage is None:
             storage = FileBasedFunctionApprovalStorage(
-                _approval_storage_path_for_user(self.FUNCTION_APPROVAL_STORAGE_PATH, user_id)
+                _approval_storage_path_for_user(
+                    self.FUNCTION_APPROVAL_STORAGE_PATH, user_id
+                )
             )
             self._approval_storages_by_user[user_id] = storage
         return storage
@@ -577,19 +588,27 @@ class ResponsesHostServer(ResponsesAgentServerHost):
 
         if self._is_workflow_agent:
             # Workflow agents are handled differently because they require checkpoint restoration
-            async for event in self._handle_inner_workflow(request, context, cancellation_signal):
+            async for event in self._handle_inner_workflow(
+                request, context, cancellation_signal
+            ):
                 yield event
         else:
-            async for event in self._handle_inner_agent(request, context, cancellation_signal):
+            async for event in self._handle_inner_agent(
+                request, context, cancellation_signal
+            ):
                 yield event
 
     @staticmethod
-    def _create_response_event_stream(request: CreateResponse, context: ResponseContext) -> ResponseEventStream:
+    def _create_response_event_stream(
+        request: CreateResponse, context: ResponseContext
+    ) -> ResponseEventStream:
         """Create a response stream seeded from recovery state when available."""
         if context.is_recovery:
             persisted_response = context.persisted_response
             if persisted_response is not None:
-                return ResponseEventStream(response=persisted_response, response_id=context.response_id)
+                return ResponseEventStream(
+                    response=persisted_response, response_id=context.response_id
+                )
         return ResponseEventStream(response_id=context.response_id, model=request.model)
 
     async def _handle_inner_agent(
@@ -611,12 +630,18 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             user_id = context.platform_context.user_id_key
             approval_storage = self._approval_storage_for_user(user_id)
             input_items = await context.get_input_items()
-            input_messages = await _items_to_messages(input_items, approval_storage=approval_storage)
+            input_messages = await _items_to_messages(
+                input_items, approval_storage=approval_storage
+            )
 
             history = await context.get_history()
             run_kwargs: dict[str, Any] = {
                 "messages": [
-                    *(await _output_items_to_messages(history, approval_storage=approval_storage)),
+                    *(
+                        await _output_items_to_messages(
+                            history, approval_storage=approval_storage
+                        )
+                    ),
                     *input_messages,
                 ]
             }
@@ -625,7 +650,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             chat_options, are_options_set = _to_chat_options(request)
 
             if are_options_set and not isinstance(self._agent, RawAgent):
-                logger.warning("Agent doesn't support runtime options. They will be ignored.")
+                logger.warning(
+                    "Agent doesn't support runtime options. They will be ignored."
+                )
             else:
                 run_kwargs["options"] = chat_options
 
@@ -657,7 +684,11 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 yield response_event_stream.emit_completed()
                 return
 
-            tracker = _OutputItemTracker(response_event_stream) if is_streaming_request else None
+            tracker = (
+                _OutputItemTracker(response_event_stream)
+                if is_streaming_request
+                else None
+            )
 
             if not is_streaming_request:
                 # Run the agent in non-streaming mode
@@ -693,7 +724,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                         # (client_cancelled=False) completed is the right terminal.
                         logger.debug(
                             "Response handler exiting early: %s",
-                            "client cancelled" if context.client_cancelled else "steering pressure",
+                            "client cancelled"
+                            if context.client_cancelled
+                            else "steering pressure",
                         )
                         yield response_event_stream.emit_completed()
                         return
@@ -741,21 +774,32 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             user_id = context.platform_context.user_id_key
             approval_storage = self._approval_storage_for_user(user_id)
             input_items = await context.get_input_items()
-            input_messages = await _items_to_messages(input_items, approval_storage=approval_storage)
+            input_messages = await _items_to_messages(
+                input_items, approval_storage=approval_storage
+            )
             is_streaming_request = request.stream is not None and request.stream is True
 
             _, are_options_set = _to_chat_options(request)
             if are_options_set:
-                logger.warning("Workflow agent doesn't support runtime options. They will be ignored.")
+                logger.warning(
+                    "Workflow agent doesn't support runtime options. They will be ignored."
+                )
 
-            if request.previous_response_id is not None and context.conversation_id is not None:
-                raise RuntimeError("Previous response ID cannot be used in conjunction with conversation ID.")
+            if (
+                request.previous_response_id is not None
+                and context.conversation_id is not None
+            ):
+                raise RuntimeError(
+                    "Previous response ID cannot be used in conjunction with conversation ID."
+                )
             context_id = request.previous_response_id or context.conversation_id
 
             # The following should never happen due to the checks above.
             # This is for type safety and defensive programming.
             if self._checkpoint_storage_path is None:
-                raise RuntimeError("Checkpoint storage path is not configured for workflow agent.")
+                raise RuntimeError(
+                    "Checkpoint storage path is not configured for workflow agent."
+                )
             if not isinstance(self._agent, WorkflowAgent):
                 raise RuntimeError("Agent is not a workflow agent.")
 
@@ -789,7 +833,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 restore_storage = _checkpoint_storage_for_context(
                     self._checkpoint_storage_path, context_id, user_id=user_id
                 )
-                latest_checkpoint = await restore_storage.get_latest(workflow_name=self._agent.workflow.name)
+                latest_checkpoint = await restore_storage.get_latest(
+                    workflow_name=self._agent.workflow.name
+                )
                 if latest_checkpoint is not None:
                     latest_checkpoint_id = latest_checkpoint.checkpoint_id
 
@@ -852,7 +898,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 ):
                     yield item
 
-                await self._delete_not_latest_checkpoints(write_storage, self._agent.workflow.name)
+                await self._delete_not_latest_checkpoints(
+                    write_storage, self._agent.workflow.name
+                )
                 yield response_event_stream.emit_completed()
                 return
 
@@ -875,7 +923,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                         yield event
                     logger.debug(
                         "Workflow response handler exiting early: %s",
-                        "client cancelled" if context.client_cancelled else "steering pressure",
+                        "client cancelled"
+                        if context.client_cancelled
+                        else "steering pressure",
                     )
                     yield response_event_stream.emit_completed()
                     return
@@ -895,7 +945,9 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             for event in tracker.close():
                 yield event
 
-            await self._delete_not_latest_checkpoints(write_storage, self._agent.workflow.name)
+            await self._delete_not_latest_checkpoints(
+                write_storage, self._agent.workflow.name
+            )
             checkpoint_event = _checkpoint_if_supported(response_event_stream)
             if checkpoint_event is not None:
                 yield checkpoint_event
@@ -906,14 +958,20 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 yield event
 
     @staticmethod
-    async def _delete_not_latest_checkpoints(checkpoint_storage: FileCheckpointStorage, workflow_name: str) -> None:
+    async def _delete_not_latest_checkpoints(
+        checkpoint_storage: FileCheckpointStorage, workflow_name: str
+    ) -> None:
         """Delete all checkpoints except the latest one.
 
         We only need the last checkpoint for each invocation.
         """
-        latest_checkpoint = await checkpoint_storage.get_latest(workflow_name=workflow_name)
+        latest_checkpoint = await checkpoint_storage.get_latest(
+            workflow_name=workflow_name
+        )
         if latest_checkpoint is not None:
-            all_checkpoints = await checkpoint_storage.list_checkpoints(workflow_name=workflow_name)
+            all_checkpoints = await checkpoint_storage.list_checkpoints(
+                workflow_name=workflow_name
+            )
             for checkpoint in all_checkpoints:
                 if checkpoint.checkpoint_id != latest_checkpoint.checkpoint_id:
                     await checkpoint_storage.delete(checkpoint.checkpoint_id)
@@ -954,7 +1012,9 @@ class _OutputItemTracker:
     for text messages, reasoning, function calls, and MCP calls.
     """
 
-    _DELTA_TYPES = frozenset({"text", "text_reasoning", "function_call", "mcp_server_tool_call"})
+    _DELTA_TYPES = frozenset(
+        {"text", "text_reasoning", "function_call", "mcp_server_tool_call"}
+    )
 
     def __init__(self, stream: ResponseEventStream) -> None:
         self._stream = stream
@@ -969,7 +1029,9 @@ class _OutputItemTracker:
         self._summary_part: ReasoningSummaryPartBuilder | None = None
         self._fc_builder: OutputItemFunctionCallBuilder | None = None
         self._mcp_builder: OutputItemMcpCallBuilder | None = None
-        self._mcp_call_id: str | None = None  # call_id of the in-progress MCP call for result matching
+        self._mcp_call_id: str | None = (
+            None  # call_id of the in-progress MCP call for result matching
+        )
         self.needs_async = False
 
     def handle(self, content: Content) -> Generator[ResponseStreamEvent]:
@@ -995,7 +1057,10 @@ class _OutputItemTracker:
                 yield self._summary_part.emit_text_delta(content.text)
 
         elif content.type == "function_call" and content.call_id is not None:
-            if self._active_type != "function_call" or self._active_id != content.call_id:
+            if (
+                self._active_type != "function_call"
+                or self._active_id != content.call_id
+            ):
                 yield from self._close()
                 yield from self._open_function_call(content)
             args_str = _arguments_to_str(content.arguments)
@@ -1004,7 +1069,10 @@ class _OutputItemTracker:
                 yield self._fc_builder.emit_arguments_delta(args_str)
 
         elif content.type == "mcp_server_tool_call" and content.tool_name:
-            key = content.call_id or f"{content.server_name or 'default'}::{content.tool_name}"
+            key = (
+                content.call_id
+                or f"{content.server_name or 'default'}::{content.tool_name}"
+            )
             if self._active_type != "mcp_server_tool_call" or self._active_id != key:
                 yield from self._close()
                 yield from self._open_mcp_call(content)
@@ -1076,7 +1144,10 @@ class _OutputItemTracker:
         )
         self._mcp_call_id = content.call_id
         self._active_type = "mcp_server_tool_call"
-        self._active_id = content.call_id or f"{content.server_name or 'default'}::{content.tool_name}"
+        self._active_id = (
+            content.call_id
+            or f"{content.server_name or 'default'}::{content.tool_name}"
+        )
         yield self._mcp_builder.emit_added()
 
     def _close(self) -> Generator[ResponseStreamEvent]:
@@ -1089,7 +1160,11 @@ class _OutputItemTracker:
             self._text_content = None
             self._message_item = None
 
-        elif self._active_type == "text_reasoning" and self._summary_part and self._reasoning_item:
+        elif (
+            self._active_type == "text_reasoning"
+            and self._summary_part
+            and self._reasoning_item
+        ):
             yield self._summary_part.emit_text_done(accumulated)
             yield self._summary_part.emit_done()
             yield self._reasoning_item.emit_done()
@@ -1174,7 +1249,9 @@ async def _items_to_messages(
     return messages
 
 
-async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | None = None) -> Message:
+async def _item_to_message(
+    item: Item, *, approval_storage: ApprovalStorage | None = None
+) -> Message:
     """Converts an Item to a Message.
 
     Args:
@@ -1201,14 +1278,18 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
         output_msg = cast(ItemOutputMessage, item)
         return Message(
             role=output_msg.role,
-            contents=[_convert_output_message_content(part) for part in output_msg.content],
+            contents=[
+                _convert_output_message_content(part) for part in output_msg.content
+            ],
         )
 
     if item.type == "function_call":
         fc = cast(ItemFunctionToolCall, item)
         return Message(
             role="assistant",
-            contents=[Content.from_function_call(fc.call_id, fc.name, arguments=fc.arguments)],
+            contents=[
+                Content.from_function_call(fc.call_id, fc.name, arguments=fc.arguments)
+            ],
         )
 
     if item.type == "function_call_output":
@@ -1238,7 +1319,9 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
             )
         ]
         if getattr(mcp, "output", None) is not None:
-            contents.append(Content.from_mcp_server_tool_result(call_id=mcp.id, output=mcp.output))
+            contents.append(
+                Content.from_mcp_server_tool_result(call_id=mcp.id, output=mcp.output)
+            )
         return Message(
             role="assistant",
             contents=contents,
@@ -1247,7 +1330,9 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
     if item.type == "mcp_approval_request":
         mcp_req = cast(ItemMcpApprovalRequest, item)
         if approval_storage is not None:
-            function_approval_request_content = await approval_storage.load_approval_request(mcp_req.id)
+            function_approval_request_content = (
+                await approval_storage.load_approval_request(mcp_req.id)
+            )
         else:
             raise ValueError("ApprovalStorage is required to load approval request.")
         return Message(
@@ -1258,14 +1343,20 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
     if item.type == "mcp_approval_response":
         mcp_resp = cast(MCPApprovalResponse, item)
         if approval_storage is not None:
-            function_approval_request_content = await approval_storage.load_approval_request(
-                mcp_resp.approval_request_id
+            function_approval_request_content = (
+                await approval_storage.load_approval_request(
+                    mcp_resp.approval_request_id
+                )
             )
         else:
             raise ValueError("ApprovalStorage is required to load approval request.")
         return Message(
             role="user",
-            contents=[function_approval_request_content.to_function_approval_response(mcp_resp.approve)],
+            contents=[
+                function_approval_request_content.to_function_approval_response(
+                    mcp_resp.approve
+                )
+            ],
         )
 
     if item.type == "code_interpreter_call":
@@ -1301,7 +1392,9 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
             Content.from_shell_command_output(
                 stdout=out.stdout or "",
                 stderr=out.stderr or "",
-                exit_code=getattr(out.outcome, "exit_code", None) if hasattr(out, "outcome") else None,
+                exit_code=getattr(out.outcome, "exit_code", None)
+                if hasattr(out, "outcome")
+                else None,
             )
             for out in (sco.output or [])
         ]
@@ -1318,7 +1411,11 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
 
     if item.type == "local_shell_call":
         lsc = cast(ItemLocalShellToolCall, item)
-        commands = lsc.action.command if hasattr(lsc.action, "command") and lsc.action.command else []
+        commands = (
+            lsc.action.command
+            if hasattr(lsc.action, "command") and lsc.action.command
+            else []
+        )
         return Message(
             role="assistant",
             contents=[
@@ -1379,14 +1476,18 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
         cco = cast(ComputerCallOutputItemParam, item)
         return Message(
             role="tool",
-            contents=[Content.from_function_result(cco.call_id, result=str(cco.output))],
+            contents=[
+                Content.from_function_result(cco.call_id, result=str(cco.output))
+            ],
         )
 
     if item.type == "custom_tool_call":
         ct = cast(ItemCustomToolCall, item)
         return Message(
             role="assistant",
-            contents=[Content.from_function_call(ct.call_id, ct.name, arguments=ct.input)],
+            contents=[
+                Content.from_function_call(ct.call_id, ct.name, arguments=ct.input)
+            ],
         )
 
     if item.type == "custom_tool_call_output":
@@ -1402,7 +1503,11 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
         if cto.call_id and cto.call_id.startswith("mcp_"):
             return Message(
                 role="tool",
-                contents=[Content.from_mcp_server_tool_result(call_id=cto.call_id, output=output)],
+                contents=[
+                    Content.from_mcp_server_tool_result(
+                        call_id=cto.call_id, output=output
+                    )
+                ],
             )
         return Message(
             role="tool",
@@ -1426,7 +1531,9 @@ async def _item_to_message(item: Item, *, approval_storage: ApprovalStorage | No
         apo = cast(ApplyPatchToolCallOutputItemParam, item)
         return Message(
             role="tool",
-            contents=[Content.from_function_result(apo.call_id, result=apo.output or "")],
+            contents=[
+                Content.from_function_result(apo.call_id, result=apo.output or "")
+            ],
         )
 
     raise ValueError(f"Unsupported Item type: {item.type}")
@@ -1449,11 +1556,15 @@ async def _output_items_to_messages(
     """
     messages: list[Message] = []
     for item in history:
-        messages.append(await _output_item_to_message(item, approval_storage=approval_storage))
+        messages.append(
+            await _output_item_to_message(item, approval_storage=approval_storage)
+        )
     return messages
 
 
-async def _output_item_to_message(item: OutputItem, *, approval_storage: ApprovalStorage | None = None) -> Message:
+async def _output_item_to_message(
+    item: OutputItem, *, approval_storage: ApprovalStorage | None = None
+) -> Message:
     """Converts an OutputItem to a Message.
 
     Args:
@@ -1471,7 +1582,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
         output_msg = cast(OutputItemOutputMessage, item)
         return Message(
             role=output_msg.role,
-            contents=[_convert_output_message_content(part) for part in output_msg.content],
+            contents=[
+                _convert_output_message_content(part) for part in output_msg.content
+            ],
         )
 
     if item.type == "message":
@@ -1485,7 +1598,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
         fc = cast(OutputItemFunctionToolCall, item)
         return Message(
             role="assistant",
-            contents=[Content.from_function_call(fc.call_id, fc.name, arguments=fc.arguments)],
+            contents=[
+                Content.from_function_call(fc.call_id, fc.name, arguments=fc.arguments)
+            ],
         )
 
     if item.type == "function_call_output":
@@ -1515,7 +1630,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
             )
         ]
         if getattr(mcp, "output", None) is not None:
-            contents.append(Content.from_mcp_server_tool_result(call_id=mcp.id, output=mcp.output))
+            contents.append(
+                Content.from_mcp_server_tool_result(call_id=mcp.id, output=mcp.output)
+            )
         return Message(
             role="assistant",
             contents=contents,
@@ -1524,7 +1641,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
     if item.type == "mcp_approval_request":
         mcp_req = cast(OutputItemMcpApprovalRequest, item)
         if approval_storage is not None:
-            function_approval_request_content = await approval_storage.load_approval_request(mcp_req.id)
+            function_approval_request_content = (
+                await approval_storage.load_approval_request(mcp_req.id)
+            )
         else:
             raise ValueError("ApprovalStorage is required to load approval request.")
         return Message(
@@ -1535,15 +1654,21 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
     if item.type == "mcp_approval_response":
         mcp_resp = cast(OutputItemMcpApprovalResponseResource, item)
         if approval_storage is not None:
-            function_approval_request_content = await approval_storage.load_approval_request(
-                mcp_resp.approval_request_id
+            function_approval_request_content = (
+                await approval_storage.load_approval_request(
+                    mcp_resp.approval_request_id
+                )
             )
         else:
             raise ValueError("ApprovalStorage is required to load approval request.")
 
         return Message(
             role="user",
-            contents=[function_approval_request_content.to_function_approval_response(mcp_resp.approve)],
+            contents=[
+                function_approval_request_content.to_function_approval_response(
+                    mcp_resp.approve
+                )
+            ],
         )
 
     if item.type == "code_interpreter_call":
@@ -1579,7 +1704,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
             Content.from_shell_command_output(
                 stdout=out.stdout or "",
                 stderr=out.stderr or "",
-                exit_code=getattr(out.outcome, "exit_code", None) if hasattr(out, "outcome") else None,
+                exit_code=getattr(out.outcome, "exit_code", None)
+                if hasattr(out, "outcome")
+                else None,
             )
             for out in (sco.output or [])
         ]
@@ -1596,7 +1723,11 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
 
     if item.type == "local_shell_call":
         lsc = cast(OutputItemLocalShellToolCall, item)
-        commands = lsc.action.command if hasattr(lsc.action, "command") and lsc.action.command else []
+        commands = (
+            lsc.action.command
+            if hasattr(lsc.action, "command") and lsc.action.command
+            else []
+        )
         return Message(
             role="assistant",
             contents=[
@@ -1657,14 +1788,18 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
         cco = cast(OutputItemComputerToolCallOutputResource, item)
         return Message(
             role="tool",
-            contents=[Content.from_function_result(cco.call_id, result=str(cco.output))],
+            contents=[
+                Content.from_function_result(cco.call_id, result=str(cco.output))
+            ],
         )
 
     if item.type == "custom_tool_call":
         ct = cast(OutputItemCustomToolCall, item)
         return Message(
             role="assistant",
-            contents=[Content.from_function_call(ct.call_id, ct.name, arguments=ct.input)],
+            contents=[
+                Content.from_function_call(ct.call_id, ct.name, arguments=ct.input)
+            ],
         )
 
     if item.type == "custom_tool_call_output":
@@ -1678,7 +1813,11 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
         if cto.call_id and cto.call_id.startswith("mcp_"):
             return Message(
                 role="tool",
-                contents=[Content.from_mcp_server_tool_result(call_id=cto.call_id, output=output)],
+                contents=[
+                    Content.from_mcp_server_tool_result(
+                        call_id=cto.call_id, output=output
+                    )
+                ],
             )
         return Message(
             role="tool",
@@ -1702,7 +1841,9 @@ async def _output_item_to_message(item: OutputItem, *, approval_storage: Approva
         apo = cast(OutputItemApplyPatchToolCallOutput, item)
         return Message(
             role="tool",
-            contents=[Content.from_function_result(apo.call_id, result=apo.output or "")],
+            contents=[
+                Content.from_function_result(apo.call_id, result=apo.output or "")
+            ],
         )
 
     if item.type == "oauth_consent_request":
@@ -1903,10 +2044,14 @@ async def _to_outputs(
         yield mcp_call.emit_done()
     elif content.type == "mcp_server_tool_result":
         output = _stringify_mcp_output(content.output)
-        async for event in stream.aoutput_item_custom_tool_call_output(content.call_id or "", output):
+        async for event in stream.aoutput_item_custom_tool_call_output(
+            content.call_id or "", output
+        ):
             yield event
     elif content.type == "shell_tool_call":
-        action = FunctionShellAction(commands=content.commands or [], timeout_ms=0, max_output_length=0)
+        action = FunctionShellAction(
+            commands=content.commands or [], timeout_ms=0, max_output_length=0
+        )
         async for event in stream.aoutput_item_function_shell_call(
             content.call_id or "",
             action,
@@ -1923,7 +2068,9 @@ async def _to_outputs(
                     FunctionShellCallOutputContent(
                         stdout=getattr(out, "stdout", "") or "",
                         stderr=getattr(out, "stderr", "") or "",
-                        outcome=FunctionShellCallOutputExitOutcome(exit_code=exit_code if exit_code is not None else 0),
+                        outcome=FunctionShellCallOutputExitOutcome(
+                            exit_code=exit_code if exit_code is not None else 0
+                        ),
                     )
                 )
         async for event in stream.aoutput_item_function_shell_call_output(
@@ -1935,7 +2082,9 @@ async def _to_outputs(
             yield event
     elif content.type == "function_approval_request":
         function_call: Content = content.function_call  # type: ignore
-        server_label = function_call.additional_properties.get("server_label", "agent_framework")
+        server_label = function_call.additional_properties.get(
+            "server_label", "agent_framework"
+        )
         request_saved = False
         async for event in stream.aoutput_item_mcp_approval_request(
             server_label,
@@ -1950,7 +2099,9 @@ async def _to_outputs(
                 item = getattr(event, "item", None)
                 if item is not None and getattr(item, "id", None) is not None:
                     approval_request_id = cast(str, item.id)
-                    await approval_storage.save_approval_request(approval_request_id, content)
+                    await approval_storage.save_approval_request(
+                        approval_request_id, content
+                    )
                     request_saved = True
             yield event
         if approval_storage is not None and not request_saved:
@@ -1960,7 +2111,9 @@ async def _to_outputs(
             )
     else:
         # Log a warning for unsupported content types instead of raising an error to avoid breaking the response stream.
-        logger.warning(f"Content type '{content.type}' is not supported yet. This is usually safe to ignore.")
+        logger.warning(
+            f"Content type '{content.type}' is not supported yet. This is usually safe to ignore."
+        )
 
 
 def _stringify_mcp_output(output: Any) -> str:
@@ -2007,7 +2160,9 @@ async def _emit_completed_mcp_call(
     yield mcp_call.emit_arguments_done(arguments)
     yield mcp_call.emit_completed()
     yield mcp_call.emit_done()
-    async for event in stream.aoutput_item_custom_tool_call_output(call_content.call_id or "", output):
+    async for event in stream.aoutput_item_custom_tool_call_output(
+        call_content.call_id or "", output
+    ):
         yield event
 
 
@@ -2029,7 +2184,10 @@ async def _to_outputs_for_messages(
     for message in messages:
         for content in message.contents:
             if pending_mcp_call is not None:
-                if content.type == "mcp_server_tool_result" and content.call_id == pending_mcp_call.call_id:
+                if (
+                    content.type == "mcp_server_tool_result"
+                    and content.call_id == pending_mcp_call.call_id
+                ):
                     async for event in _emit_completed_mcp_call(
                         stream,
                         pending_mcp_call,
@@ -2040,7 +2198,9 @@ async def _to_outputs_for_messages(
                     pending_mcp_call = None
                     continue
 
-                async for event in _to_outputs(stream, pending_mcp_call, approval_storage=approval_storage):
+                async for event in _to_outputs(
+                    stream, pending_mcp_call, approval_storage=approval_storage
+                ):
                     yield event
                 pending_mcp_call = None
 
@@ -2048,11 +2208,15 @@ async def _to_outputs_for_messages(
                 pending_mcp_call = content
                 continue
 
-            async for event in _to_outputs(stream, content, approval_storage=approval_storage):
+            async for event in _to_outputs(
+                stream, content, approval_storage=approval_storage
+            ):
                 yield event
 
     if pending_mcp_call is not None:
-        async for event in _to_outputs(stream, pending_mcp_call, approval_storage=approval_storage):
+        async for event in _to_outputs(
+            stream, pending_mcp_call, approval_storage=approval_storage
+        ):
             yield event
 
 
