@@ -17,14 +17,18 @@ from typing import Literal, Protocol, cast
 
 from agent_framework import (
     ChatOptions,
+    CheckpointID,
+    CheckpointStorage,
     Content,
     ContextProvider,
     FileCheckpointStorage,
     HistoryProvider,
+    InMemoryCheckpointStorage,
     Message,
     RawAgent,
     SupportsAgentRun,
     WorkflowAgent,
+    WorkflowCheckpoint,
 )
 from agent_framework.exceptions import AgentFrameworkException
 from azure.ai.agentserver.responses import (
@@ -287,6 +291,52 @@ def _checkpoint_storage_for_context(root: str, context_id: str, *, user_id: str 
     )
 
 
+class _ContextAwareCheckpointStorage:
+    """A :class:`CheckpointStorage` decorator that runs request-scoped post-save logic.
+
+    The workflow saves checkpoints internally with no post-save hook, so we wrap
+    the storage handed to ``run()``: :meth:`save` persists to the inner storage
+    then performs the request-scoped post-save logic, which uses the request's
+    ``ResponseEventStream``. Every other operation delegates unchanged to the
+    inner storage.
+
+    Created **per request** so it can hold the request's response stream while
+    the wrapped inner storage stays cached/persistent across turns.
+
+    Note:
+        The post-save logic runs inside the workflow's ``run()`` call stack, so
+        it cannot yield events onto the response stream; it may only read or
+        mutate the stream.
+    """
+
+    # Reserved key for storing the most recent checkpoint ID for crash recovery
+    LATEST_CHECKPOINT_ID_KEY = "last_checkpoint_id"
+
+    def __init__(self, inner: CheckpointStorage, response_event_stream: ResponseEventStream) -> None:
+        self._inner = inner
+        self._response_event_stream = response_event_stream
+
+    async def save(self, checkpoint: WorkflowCheckpoint) -> CheckpointID:
+        checkpoint_id = await self._inner.save(checkpoint)
+        self._response_event_stream.internal_metadata[self.LATEST_CHECKPOINT_ID_KEY] = checkpoint_id
+        return checkpoint_id
+
+    async def load(self, checkpoint_id: CheckpointID) -> WorkflowCheckpoint:
+        return await self._inner.load(checkpoint_id)
+
+    async def list_checkpoints(self, *, workflow_name: str) -> list[WorkflowCheckpoint]:
+        return await self._inner.list_checkpoints(workflow_name=workflow_name)
+
+    async def delete(self, checkpoint_id: CheckpointID) -> bool:
+        return await self._inner.delete(checkpoint_id)
+
+    async def get_latest(self, *, workflow_name: str) -> WorkflowCheckpoint | None:
+        return await self._inner.get_latest(workflow_name=workflow_name)
+
+    async def list_checkpoint_ids(self, *, workflow_name: str) -> list[CheckpointID]:
+        return await self._inner.list_checkpoint_ids(workflow_name=workflow_name)
+
+
 def _approval_storage_path_for_user(base_path: str, user_id: str) -> str:
     """Return the per-user approval storage file path under the base directory.
 
@@ -449,25 +499,35 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 provider.source_id,
             )
 
+        resilient_background = bool(options and options.resilient_background)
+
         self._is_workflow_agent = False
-        self._checkpoint_storage_path = None
+        self._checkpoint_storage_path: str | None = None
         if isinstance(agent, WorkflowAgent):
             if agent.workflow._runner_context.has_checkpointing():  # pyright: ignore[reportPrivateUsage]
                 raise RuntimeError(
                     "There should not be a checkpoint storage already present in the workflow agent. "
                     "The hosting infrastructure will manage checkpoints instead."
                 )
-            self._checkpoint_storage_path = (
-                self.CHECKPOINT_STORAGE_PATH
-                if self.config.is_hosted
-                else os.path.join(os.getcwd(), self.CHECKPOINT_STORAGE_PATH.lstrip("/"))
-            )
             self._is_workflow_agent = True
+        elif resilient_background:
+            logger.warning(
+                "Resilient background mode is enabled for a non-workflow agent. "
+                "Crash recovery is not supported for non-workflow agents."
+            )
+
+        # Durable (file-based) storage is used when hosted, or when a workflow
+        # agent opts into resilient background execution -- crash recovery needs
+        # checkpoints and approval requests to survive a process restart.
+        # Otherwise local development keeps everything in memory.
+        use_file_storage = self.config.is_hosted or (resilient_background and self._is_workflow_agent)
+        if self._is_workflow_agent and use_file_storage:
+            self._checkpoint_storage_path = self._resolve_storage_path(self.CHECKPOINT_STORAGE_PATH)
 
         self._agent = agent
         self._approval_storage = (
-            FileBasedFunctionApprovalStorage(self.FUNCTION_APPROVAL_STORAGE_PATH)
-            if self.config.is_hosted
+            FileBasedFunctionApprovalStorage(self._resolve_storage_path(self.FUNCTION_APPROVAL_STORAGE_PATH))
+            if use_file_storage
             else InMemoryFunctionApprovalStorage()
         )
         # Per-user (multi-tenant) approval stores. Hosted file-based approval
@@ -478,6 +538,12 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         # (in-memory) dev and protocol v1 (no user id) keep the single shared
         # ``self._approval_storage``.
         self._approval_storages_by_user: dict[str, ApprovalStorage] = {}
+        # Per-context (and per-user) in-memory checkpoint stores used for local
+        # (non-hosted) development. Hosted deployments persist checkpoints to disk
+        # via FileCheckpointStorage instead. Instances are cached by
+        # (user_id, context_id) so a workflow's state survives across turns within
+        # the same process, matching the persistence the file layout provides.
+        self._checkpoint_storages_by_key: dict[tuple[str | None, str], CheckpointStorage] = {}
         # Lazy agent lifecycle: the agent (and any MCP tools it owns) is entered on
         # the first request rather than at server startup, so that authentication
         # failures during MCP connect can be surfaced to the client as an
@@ -514,6 +580,18 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         if stack is not None:
             self._agent_stack = None
             await stack.aclose()
+
+    def _resolve_storage_path(self, mount_path: str) -> str:
+        """Resolve a durable storage mount path for the current environment.
+
+        Hosted deployments use the absolute container mount path as-is. Local
+        (non-hosted) resilient runs re-root the same relative layout under the
+        current working directory so file-based storage works without a mounted
+        volume.
+        """
+        if self.config.is_hosted:
+            return mount_path
+        return os.path.join(os.getcwd(), mount_path.lstrip("/"))
 
     def _approval_storage_for_user(self, user_id: str | None) -> ApprovalStorage:
         """Return the approval storage scoped to ``user_id`` when applicable.
@@ -558,6 +636,11 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             async for event in self._handle_inner_workflow(request, context, cancellation_signal):
                 yield event
         else:
+            if context.is_recovery:
+                logger.warning(
+                    "Recovery mode is not supported for non-workflow agents. "
+                    "The agent will restart from the original input."
+                )
             async for event in self._handle_inner_agent(request, context, cancellation_signal):
                 yield event
 
@@ -636,11 +719,6 @@ class ResponsesHostServer(ResponsesAgentServerHost):
                 return
 
             async for update in self._agent.run(stream=True, **run_kwargs):  # type: ignore[reportUnknownMemberType]
-                # Cooperative exit on shutdown: defer to crash recovery when durable.
-                if context.shutdown.is_set():
-                    for event in tracker.close():
-                        yield event
-                    await context.exit_for_recovery()
                 if cancellation_signal is not None and cancellation_signal.is_set():
                     for event in tracker.close():
                         yield event
@@ -682,6 +760,11 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         cancellation_signal: asyncio.Event | None = None,
     ) -> AsyncIterable[ResponseStreamEvent]:
         """Handle the creation of a response for a workflow agent."""
+        # The following should never happen due to the checks above.
+        # This is for type safety and defensive programming.
+        if not isinstance(self._agent, WorkflowAgent):
+            raise RuntimeError("Agent is not a workflow agent.")
+
         response_event_stream = self._create_response_event_stream(request, context)
         yield response_event_stream.emit_created()
         yield response_event_stream.emit_in_progress()
@@ -691,103 +774,75 @@ class ResponsesHostServer(ResponsesAgentServerHost):
         # handles streaming vs. non-streaming at the platform level
         tracker: _OutputItemTracker = _OutputItemTracker(response_event_stream)
 
+        user_id = context.platform_context.user_id_key
+        approval_storage = self._approval_storage_for_user(user_id)
+
         try:
-            user_id = context.platform_context.user_id_key
-            approval_storage = self._approval_storage_for_user(user_id)
-            input_items = await context.get_input_items()
-            input_messages = await _items_to_messages(input_items, approval_storage=approval_storage)
-
-            _, are_options_set = _to_chat_options(request)
-            if are_options_set:
-                logger.warning("Workflow agent doesn't support runtime options. They will be ignored.")
-
             if request.previous_response_id is not None and context.conversation_id is not None:
                 raise RuntimeError("Previous response ID cannot be used in conjunction with conversation ID.")
             context_id = request.previous_response_id or context.conversation_id
-
-            # The following should never happen due to the checks above.
-            # This is for type safety and defensive programming.
-            if self._checkpoint_storage_path is None:
-                raise RuntimeError("Checkpoint storage path is not configured for workflow agent.")
-            if not isinstance(self._agent, WorkflowAgent):
-                raise RuntimeError("Agent is not a workflow agent.")
 
             # Workflow agents are not async context managers in any built-in path,
             # but call _ensure_agent_ready for symmetry with the regular path so
             # any future async resources owned by the workflow are entered here.
             await self._ensure_agent_ready()
 
-            # Per-user checkpoint isolation for multi-tenant hosting (container
-            # protocol v2): the per-user partition key computed above
-            # (``x-agent-user-id``) scopes every checkpoint directory for this turn,
-            # so one tenant can never restore or observe another tenant's workflow
-            # state -- even with a guessed or forged context id. The key is stable
-            # per user across turns, so multi-turn continuity is preserved. Absent
-            # (``None``)/empty in local development or protocol v1, where the
-            # unscoped single-tenant layout is used.
-
-            # Determine the latest checkpoint (if any) so we can resume the
-            # workflow's prior state for this turn. The directory is keyed by
-            # the inbound context id (conversation_id when set, otherwise
-            # previous_response_id). Multi-turn declarative workflows need the
-            # workflow's internal state (e.g. Conversation.messages,
-            # intermediate Local.* variables) to survive across user turns;
-            # the only place that state lives is the workflow checkpoint, so
-            # on every turn we restore the latest checkpoint and feed the new
-            # input back into the start executor as a continuation rather than
-            # a fresh run.
-            latest_checkpoint_id: str | None = None
-            restore_storage: FileCheckpointStorage | None = None
-            if context_id is not None:
-                restore_storage = _checkpoint_storage_for_context(
-                    self._checkpoint_storage_path, context_id, user_id=user_id
-                )
-                latest_checkpoint = await restore_storage.get_latest(workflow_name=self._agent.workflow.name)
-                if latest_checkpoint is not None:
-                    latest_checkpoint_id = latest_checkpoint.checkpoint_id
-
-            # Storage that will receive checkpoints written during this turn.
-            # When the caller chains with previous_response_id, the next turn
-            # will reference the current response_id as its previous_response_id,
-            # so new checkpoints must land under the current response_id (or the
-            # conversation_id when set). When conversation_id is set, this
-            # matches restore_storage; when only previous_response_id was
-            # supplied, restore_storage points at the *prior* response's
-            # directory and write_storage points at the *current* response's.
-            write_context_id = context.conversation_id or context.response_id
-            write_storage = _checkpoint_storage_for_context(
-                self._checkpoint_storage_path, write_context_id, user_id=user_id
+            restore_storage, latest_checkpoint_id, write_storage = await self._resolve_checkpoint_storages(
+                context, context_id, user_id, response_event_stream
             )
 
-            # Multi-turn pattern: when we have a prior checkpoint, restore it
-            # first (drive the workflow back to idle with prior state intact),
-            # then make a separate call that delivers the new user input. This
-            # depends on Workflow.run preserving shared state across calls. The
-            # restore-only call may yield events from any pending in-flight
-            # work in the checkpoint; we consume those internally here so they
-            # don't surface to the response stream as duplicates.
-            #
-            # If the restored checkpoint had pending request_info events, the
-            # restore-only call replays them through
-            # ``WorkflowAgent._convert_workflow_event_to_agent_response_updates``
-            # and populates ``self._agent.pending_requests``. That is the correct
-            # state: those requests are genuinely outstanding, and the next
-            # ``run(input_messages, ...)`` call may contain ``function_call_output``
-            # items (carried as FunctionResult/FunctionApprovalResponse content)
-            # that fulfill them via :meth:`WorkflowAgent._process_pending_requests`.
-            if latest_checkpoint_id is not None:
-                async for _ in self._agent.run(
+            # Select the workflow run to drive this turn. Recovery resumes from
+            # the last persisted checkpoint; a normal turn optionally restores a
+            # prior checkpoint first (consumed internally) and then delivers the
+            # new user input. Both paths feed the same event-processing loop below.
+            if context.is_recovery:
+                # Upon recovery, the restore and write storages are the same.
+                run_stream = self._agent.run(
                     stream=True,
-                    checkpoint_id=latest_checkpoint_id,
+                    checkpoint_id=response_event_stream.internal_metadata.get(
+                        _ContextAwareCheckpointStorage.LATEST_CHECKPOINT_ID_KEY
+                    ),
                     checkpoint_storage=restore_storage,
-                ):
-                    pass
+                )
+            else:
+                input_items = await context.get_input_items()
+                input_messages = await _items_to_messages(input_items, approval_storage=approval_storage)
 
-            async for update in self._agent.run(
-                input_messages,
-                stream=True,
-                checkpoint_storage=write_storage,
-            ):
+                _, are_options_set = _to_chat_options(request)
+                if are_options_set:
+                    logger.warning("Workflow agent doesn't support runtime options. They will be ignored.")
+
+                # Multi-turn pattern: when we have a prior checkpoint, restore it
+                # first (drive the workflow back to idle with prior state intact),
+                # then make a separate call that delivers the new user input. This
+                # depends on Workflow.run preserving shared state across calls. The
+                # restore-only call may yield events from any pending in-flight
+                # work in the checkpoint; we consume those internally here so they
+                # don't surface to the response stream as duplicates.
+                #
+                # If the restored checkpoint had pending request_info events, the
+                # restore-only call replays them through
+                # ``WorkflowAgent._convert_workflow_event_to_agent_response_updates``
+                # and populates ``self._agent.pending_requests``. That is the correct
+                # state: those requests are genuinely outstanding, and the next
+                # ``run(input_messages, ...)`` call may contain ``function_call_output``
+                # items (carried as FunctionResult/FunctionApprovalResponse content)
+                # that fulfill them via :meth:`WorkflowAgent._process_pending_requests`.
+                if latest_checkpoint_id is not None:
+                    async for _ in self._agent.run(
+                        stream=True,
+                        checkpoint_id=latest_checkpoint_id,
+                        checkpoint_storage=restore_storage,
+                    ):
+                        pass
+
+                run_stream = self._agent.run(
+                    input_messages,
+                    stream=True,
+                    checkpoint_storage=write_storage,
+                )
+
+            async for update in run_stream:
                 # Cooperative exit on shutdown: defer to crash recovery when durable.
                 if context.shutdown.is_set():
                     for event in tracker.close():
@@ -827,8 +882,98 @@ class ResponsesHostServer(ResponsesAgentServerHost):
             for event in self._emit_failure(response_event_stream, tracker, ex):
                 yield event
 
+    def _get_checkpoint_storage(
+        self, context_id: str, user_id: str | None, response_event_stream: ResponseEventStream
+    ) -> CheckpointStorage:
+        """Return the checkpoint storage for ``context_id``, file-based when durable else in-memory.
+
+        Mirrors the approval-storage strategy: a durable checkpoint path is
+        configured when hosted, or when a workflow agent opts into resilient
+        background execution; in that case checkpoints persist to disk
+        (partitioned per user and per context id via
+        :class:`FileCheckpointStorage`). Otherwise local development keeps them
+        in memory, cached by ``(user_id, context_id)`` so a workflow's state
+        survives across turns within the same process.
+
+        The resolved storage is wrapped in :class:`_ContextAwareCheckpointStorage`
+        so request-scoped post-save logic (tied to ``response_event_stream``) runs
+        after every checkpoint save.
+
+        Raises:
+            RuntimeError: If ``context_id`` / ``user_id`` is not a safe single path segment.
+        """
+        if self._checkpoint_storage_path is not None:
+            inner: CheckpointStorage = _checkpoint_storage_for_context(
+                self._checkpoint_storage_path, context_id, user_id=user_id
+            )
+        else:
+            key = (user_id, context_id)
+            cached = self._checkpoint_storages_by_key.get(key)
+            if cached is None:
+                cached = InMemoryCheckpointStorage()
+                self._checkpoint_storages_by_key[key] = cached
+            inner = cached
+        return _ContextAwareCheckpointStorage(inner, response_event_stream)
+
+    async def _resolve_checkpoint_storages(
+        self,
+        context: ResponseContext,
+        context_id: str | None,
+        user_id: str | None,
+        response_event_stream: ResponseEventStream,
+    ) -> tuple[CheckpointStorage | None, str | None, CheckpointStorage]:
+        """Resolve the restore/write checkpoint storages for this workflow turn.
+
+        Per-user checkpoint isolation for multi-tenant hosting (container
+        protocol v2): the per-user partition key (``x-agent-user-id``) scopes
+        every checkpoint directory for this turn, so one tenant can never
+        restore or observe another tenant's workflow state -- even with a
+        guessed or forged context id. The key is stable per user across turns,
+        so multi-turn continuity is preserved. Absent (``None``)/empty in local
+        development or protocol v1, where the unscoped single-tenant layout is
+        used.
+
+        The restore storage determines the latest checkpoint (if any) so we can
+        resume the workflow's prior state for this turn. Its directory is keyed
+        by the inbound context id (``conversation_id`` when set, otherwise
+        ``previous_response_id``). Multi-turn declarative workflows need the
+        workflow's internal state (e.g. Conversation.messages, intermediate
+        Local.* variables) to survive across user turns; the only place that
+        state lives is the workflow checkpoint, so on every turn we restore the
+        latest checkpoint and feed the new input back into the start executor as
+        a continuation rather than a fresh run.
+
+        The write storage receives checkpoints written during this turn. When
+        the caller chains with ``previous_response_id``, the next turn will
+        reference the current ``response_id`` as its ``previous_response_id``, so
+        new checkpoints must land under the current ``response_id`` (or the
+        ``conversation_id`` when set). When ``conversation_id`` is set, this
+        matches the restore storage; when only ``previous_response_id`` was
+        supplied, the restore storage points at the *prior* response's directory
+        and the write storage points at the *current* response's.
+
+        Returns:
+            A tuple of ``(restore_storage, latest_checkpoint_id, write_storage)``,
+            where ``restore_storage`` and ``latest_checkpoint_id`` are ``None``
+            when there is no inbound context id / no prior checkpoint.
+        """
+        if not isinstance(self._agent, WorkflowAgent):
+            raise RuntimeError("Agent is not a workflow agent.")
+
+        latest_checkpoint_id: str | None = None
+        restore_storage: CheckpointStorage | None = None
+        if context_id is not None:
+            restore_storage = self._get_checkpoint_storage(context_id, user_id, response_event_stream)
+            latest_checkpoint = await restore_storage.get_latest(workflow_name=self._agent.workflow.name)
+            if latest_checkpoint is not None:
+                latest_checkpoint_id = latest_checkpoint.checkpoint_id
+
+        write_context_id = context.conversation_id or context.response_id
+        write_storage = self._get_checkpoint_storage(write_context_id, user_id, response_event_stream)
+        return restore_storage, latest_checkpoint_id, write_storage
+
     @staticmethod
-    async def _delete_not_latest_checkpoints(checkpoint_storage: FileCheckpointStorage, workflow_name: str) -> None:
+    async def _delete_not_latest_checkpoints(checkpoint_storage: CheckpointStorage, workflow_name: str) -> None:
         """Delete all checkpoints except the latest one.
 
         We only need the last checkpoint for each invocation.
